@@ -128,7 +128,8 @@ class RotatingFileHandler(BaseRotatingHandler):
     to the next when the current file reaches a certain size.
     """
     def __init__(self, filename, mode='a', maxBytes=0, backupCount=0,
-                 encoding=None, delay=False, errors=None):
+                 encoding=None, delay=False, errors=None, *,
+                 multiProcess=False):
         """
         Open the specified file and use it as the stream for logging.
 
@@ -148,6 +149,20 @@ class RotatingFileHandler(BaseRotatingHandler):
         respectively.
 
         If maxBytes is zero, rollover never occurs.
+
+        If multiProcess is true, the handler coordinates with other
+        processes which log to the same file with the option enabled, so
+        that records are not lost or written to the wrong backup file when
+        several processes emit records and roll over concurrently.
+        Coordination uses a lock file named after the base file with
+        ".lock" appended, which is created next to the log file and never
+        removed; the lock is released by the operating system if a process
+        dies while holding it. The lock is taken and released for every
+        emitted record, so this option adds per-record overhead and is
+        therefore disabled by default. On Windows the active file cannot
+        be renamed while another process has it open; rollover then falls
+        back to copying the active file to the first backup and truncating
+        it, which produces the same file contents.
         """
         # If rotation/rollover is wanted, it doesn't make sense to use another
         # mode. If for example 'w' were specified, then if there were multiple
@@ -162,6 +177,123 @@ class RotatingFileHandler(BaseRotatingHandler):
                                      delay=delay, errors=errors)
         self.maxBytes = maxBytes
         self.backupCount = backupCount
+        self.multiProcess = multiProcess
+        self._lockFileFd = None
+        self._lockFilePid = None
+
+    def emit(self, record):
+        """
+        Emit a record.
+
+        If multiProcess is true, the interprocess lock is held while
+        checking for rollover, rolling over and writing the record, so
+        that these steps cannot interleave with the same steps in other
+        processes.
+        """
+        if not self.multiProcess:
+            BaseRotatingHandler.emit(self, record)
+            return
+        try:
+            self._acquireInterProcessLock()
+            try:
+                if self.stream is None:                 # delay was set...
+                    self.stream = self._open()
+                else:
+                    self._refreshStream()
+                if self.shouldRollover(record):
+                    self.doRollover()
+                logging.FileHandler.emit(self, record)
+            finally:
+                self._releaseInterProcessLock()
+        except Exception:
+            self.handleError(record)
+
+    def _refreshStream(self):
+        """
+        Make sure the stream refers to the current base file.
+
+        Called with the interprocess lock held. If another process has
+        rotated the log since this process opened its stream, the stream
+        refers to a renamed backup: close it and reopen the base file.
+        Otherwise reposition the stream at the end of the file, which
+        other processes may have moved by appending to the file, or by
+        truncating it during a copy-and-truncate rollover on Windows.
+        """
+        try:
+            st = os.stat(self.baseFilename)
+        except FileNotFoundError:
+            st = None
+        if st is not None:
+            fst = os.fstat(self.stream.fileno())
+            if (st.st_ino, st.st_dev) == (fst.st_ino, fst.st_dev):
+                try:
+                    self.stream.seek(0, io.SEEK_END)
+                except OSError:
+                    # Non-seekable stream, e.g. a pipe: shouldRollover()
+                    # never rolls such files over anyway.
+                    pass
+                return
+        self.stream.close()
+        self.stream = self._open()
+
+    def _openLockFile(self):
+        """
+        Open the lock file used to coordinate with other processes.
+
+        The lock file is never deleted: deleting it would let a process
+        lock a different inode than the processes which still have the
+        unlinked file open.
+        """
+        self._lockFileFd = os.open(self.baseFilename + ".lock",
+                                   os.O_RDWR | os.O_CREAT, 0o666)
+        self._lockFilePid = os.getpid()
+
+    def _closeLockFile(self):
+        fd, self._lockFileFd = self._lockFileFd, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _acquireInterProcessLock(self):
+        if self._lockFileFd is None or self._lockFilePid != os.getpid():
+            # After fork(), the descriptor refers to the same open file
+            # description as in the parent, and flock() locks are per
+            # open file description: reopen to get one of our own.
+            self._closeLockFile()
+            self._openLockFile()
+        if os.name == 'posix':
+            import fcntl
+            fcntl.flock(self._lockFileFd, fcntl.LOCK_EX)
+        elif os.name == 'nt':
+            import errno
+            import msvcrt
+            while True:
+                try:
+                    os.lseek(self._lockFileFd, 0, os.SEEK_SET)
+                    # LK_LOCK gives up waiting after about ten seconds.
+                    msvcrt.locking(self._lockFileFd, msvcrt.LK_LOCK, 1)
+                    break
+                except OSError as e:
+                    if e.errno not in (errno.EACCES, errno.EDEADLK):
+                        raise
+                    # Keep waiting: the lock is released by the operating
+                    # system if the process holding it dies.
+        else:
+            raise NotImplementedError(
+                'multiProcess is not supported on this platform')
+
+    def _releaseInterProcessLock(self):
+        if self._lockFileFd is None:
+            return
+        if os.name == 'posix':
+            import fcntl
+            fcntl.flock(self._lockFileFd, fcntl.LOCK_UN)
+        elif os.name == 'nt':
+            import msvcrt
+            os.lseek(self._lockFileFd, 0, os.SEEK_SET)
+            msvcrt.locking(self._lockFileFd, msvcrt.LK_UNLCK, 1)
 
     def doRollover(self):
         """
@@ -182,9 +314,41 @@ class RotatingFileHandler(BaseRotatingHandler):
             dfn = self.rotation_filename(self.baseFilename + ".1")
             if os.path.exists(dfn):
                 os.remove(dfn)
-            self.rotate(self.baseFilename, dfn)
+            if self.multiProcess and not callable(self.rotator):
+                self._rotateBaseFile(dfn)
+            else:
+                self.rotate(self.baseFilename, dfn)
         if not self.delay:
             self.stream = self._open()
+
+    def _rotateBaseFile(self, dfn):
+        """
+        Rotate the base file to dfn when multiProcess is enabled.
+
+        On Windows a file cannot be renamed while another process has it
+        open, so if the rename fails because the file is in use, fall
+        back to copying the contents to the backup and truncating the
+        base file. The interprocess lock guarantees that no cooperating
+        process writes to the file between the copy and the truncation.
+        """
+        try:
+            self.rotate(self.baseFilename, dfn)
+        except PermissionError:
+            if os.name != 'nt':
+                raise
+            if os.path.exists(self.baseFilename):
+                import shutil
+                with open(self.baseFilename, 'rb') as src:
+                    with open(dfn, 'wb') as dst:
+                        shutil.copyfileobj(src, dst)
+                os.truncate(self.baseFilename, 0)
+
+    def close(self):
+        """
+        Close the handler, releasing the interprocess lock file.
+        """
+        super().close()
+        self._closeLockFile()
 
     def shouldRollover(self, record):
         """
