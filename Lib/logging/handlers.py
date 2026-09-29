@@ -31,9 +31,20 @@ import pickle
 import queue
 import re
 import socket
+import stat
 import struct
 import threading
 import time
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 #
 # Some constants...
@@ -47,6 +58,81 @@ SYSLOG_UDP_PORT             = 514
 SYSLOG_TCP_PORT             = 514
 
 _MIDNIGHT = 24 * 60 * 60  # number of seconds in a day
+
+# Process-local locks, keyed by lock file name. fcntl locks are per-process
+# and don't provide mutual exclusion between threads of the same process,
+# so handlers in the same process which share a log file are serialized
+# with these instead.
+_local_locks = {}
+_local_locks_guard = threading.Lock()
+
+def _get_local_lock(filename):
+    with _local_locks_guard:
+        lock = _local_locks.get(filename)
+        if lock is None:
+            lock = _local_locks[filename] = threading.Lock()
+        return lock
+
+class _InterProcessLock:
+    """
+    An advisory lock which serializes log file rotation between processes.
+
+    The lock is implemented with fcntl on POSIX and msvcrt on Windows. On
+    both platforms the operating system releases the lock automatically
+    when the process terminates - even if it is killed - so a process
+    which dies while holding the lock can never block the others. On
+    platforms with neither fcntl nor msvcrt the lock silently degrades
+    to a no-op.
+    """
+    def __init__(self, filename):
+        self.filename = filename
+        self.fd = None
+        self.local_lock = _get_local_lock(filename)
+
+    def reinit_after_fork(self):
+        # Called in a forked child process. The local lock may have been
+        # held by a thread which no longer exists, so replace it - but
+        # only once per filename, so that all handlers sharing the file
+        # end up with the same new lock.
+        with _local_locks_guard:
+            lock = _local_locks.get(self.filename)
+            if lock is self.local_lock:
+                lock = _local_locks[self.filename] = threading.Lock()
+            self.local_lock = lock
+
+    def acquire(self):
+        self.local_lock.acquire()
+        try:
+            if self.fd is None:
+                self.fd = os.open(self.filename, os.O_RDWR | os.O_CREAT, 0o666)
+            if fcntl is not None:
+                fcntl.lockf(self.fd, fcntl.LOCK_EX)
+            elif msvcrt is not None:
+                os.lseek(self.fd, 0, os.SEEK_SET)
+                # LK_LOCK waits (retrying for about ten seconds) for the
+                # byte to become available, and raises OSError if it
+                # doesn't.
+                msvcrt.locking(self.fd, msvcrt.LK_LOCK, 1)
+        except Exception:
+            self.local_lock.release()
+            raise
+
+    def release(self):
+        if self.fd is None:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.lockf(self.fd, fcntl.LOCK_UN)
+            elif msvcrt is not None:
+                os.lseek(self.fd, 0, os.SEEK_SET)
+                msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
+        finally:
+            self.local_lock.release()
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
 
 class BaseRotatingHandler(logging.FileHandler):
     """
@@ -126,6 +212,15 @@ class RotatingFileHandler(BaseRotatingHandler):
     """
     Handler for logging to a set of files, which switches from one file
     to the next when the current file reaches a certain size.
+
+    When rollover is enabled (maxBytes > 0), checking for and performing
+    a rollover, as well as writing each record, are done while holding an
+    _InterProcessLock on a sidecar file (the log file name with ".lock"
+    appended). This makes it safe for multiple processes to log to the
+    same file concurrently: records are never lost or written to a file
+    which has already been rotated away. The lock is released by the
+    operating system if a process dies, so a crashed process cannot
+    block the others. The sidecar file is never rotated or deleted.
     """
     def __init__(self, filename, mode='a', maxBytes=0, backupCount=0,
                  encoding=None, delay=False, errors=None):
@@ -162,29 +257,123 @@ class RotatingFileHandler(BaseRotatingHandler):
                                      delay=delay, errors=errors)
         self.maxBytes = maxBytes
         self.backupCount = backupCount
+        self._rotation_lock = None
+
+    def _acquire_rotation_lock(self):
+        lock = self._rotation_lock
+        if lock is None:
+            lock = _InterProcessLock(self.baseFilename + '.lock')
+            self._rotation_lock = lock
+        lock.acquire()
+
+    def _release_rotation_lock(self):
+        self._rotation_lock.release()
+
+    def _reattach_if_stale(self):
+        # Called with the rotation lock held. If another process has
+        # rotated the files since this handler's stream was opened, the
+        # stream still refers to a file which has been renamed (or even
+        # unlinked) since. Close it, so that it gets reopened against
+        # the current base file before anything more is written.
+        stream = self.stream
+        if stream is None:
+            return
+        try:
+            st = os.stat(self.baseFilename)
+        except OSError:
+            st = None
+        if st is not None and not stat.S_ISREG(st.st_mode):
+            # Never mess with anything other than regular files
+            # (see bpo-45401 and gh-143237).
+            return
+        fst = os.fstat(stream.fileno())
+        if st is None or (st.st_dev, st.st_ino) != (fst.st_dev, fst.st_ino):
+            stream.close()
+            self.stream = None
+
+    def emit(self, record):
+        """
+        Emit a record.
+
+        Output the record to the file, catering for rollover as described
+        in doRollover().
+        """
+        if self.maxBytes <= 0:
+            # Rollover can never happen, so no inter-process coordination
+            # is needed; behave exactly as the base class does.
+            super().emit(record)
+            return
+        try:
+            self._acquire_rotation_lock()
+            try:
+                self._reattach_if_stale()
+                if self.shouldRollover(record):
+                    self.doRollover()
+                logging.FileHandler.emit(self, record)
+            finally:
+                if os.name == 'nt' and self.stream is not None:
+                    # Windows forbids renaming or deleting a file while
+                    # another process holds it open, so don't keep the
+                    # file open between records: a lingering handle here
+                    # would make another process's rollover fail.
+                    self.stream.close()
+                    self.stream = None
+                self._release_rotation_lock()
+        except Exception:
+            self.handleError(record)
 
     def doRollover(self):
         """
         Do a rollover, as described in __init__().
         """
-        if self.stream:
-            self.stream.close()
-            self.stream = None
-        if self.backupCount > 0:
-            for i in range(self.backupCount - 1, 0, -1):
-                sfn = self.rotation_filename("%s.%d" % (self.baseFilename, i))
-                dfn = self.rotation_filename("%s.%d" % (self.baseFilename,
-                                                        i + 1))
-                if os.path.exists(sfn):
-                    if os.path.exists(dfn):
-                        os.remove(dfn)
-                    os.rename(sfn, dfn)
-            dfn = self.rotation_filename(self.baseFilename + ".1")
-            if os.path.exists(dfn):
-                os.remove(dfn)
-            self.rotate(self.baseFilename, dfn)
-        if not self.delay:
-            self.stream = self._open()
+        try:
+            if self.stream:
+                self.stream.close()
+                self.stream = None
+            if self.backupCount > 0:
+                for i in range(self.backupCount - 1, 0, -1):
+                    sfn = self.rotation_filename("%s.%d" % (self.baseFilename, i))
+                    dfn = self.rotation_filename("%s.%d" % (self.baseFilename,
+                                                            i + 1))
+                    if os.path.exists(sfn):
+                        if os.path.exists(dfn):
+                            os.remove(dfn)
+                        os.rename(sfn, dfn)
+                dfn = self.rotation_filename(self.baseFilename + ".1")
+                if os.path.exists(dfn):
+                    os.remove(dfn)
+                self.rotate(self.baseFilename, dfn)
+            if not self.delay:
+                self.stream = self._open()
+        except PermissionError as exc:
+            # On Windows, renaming or removing a file fails with
+            # ERROR_ACCESS_DENIED or ERROR_SHARING_VIOLATION if some
+            # process holds it open without delete sharing. Cooperating
+            # processes never do (see emit), so this can only be caused
+            # by an unrelated process, e.g. a file viewer. Degrade by
+            # skipping this rollover: the base file keeps growing past
+            # maxBytes and the rollover is retried when the next record
+            # is emitted. On other platforms, and for any other error,
+            # report the failure through the usual error handling path.
+            if os.name != 'nt' or getattr(exc, 'winerror', None) not in (5, 32):
+                raise
+
+    def close(self):
+        """
+        Closes the stream and the rotation lock file.
+        """
+        try:
+            super().close()
+        finally:
+            lock, self._rotation_lock = self._rotation_lock, None
+            if lock is not None:
+                lock.close()
+
+    def _at_fork_reinit(self):
+        super()._at_fork_reinit()
+        lock = self._rotation_lock
+        if lock is not None:
+            lock.reinit_after_fork()
 
     def shouldRollover(self, record):
         """
